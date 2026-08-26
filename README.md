@@ -161,5 +161,4 @@ benchmarks/  benchmark scripts and fixtures
 
 - [SKILL.md](SKILL.md) — AI-skill definition and quick workflow.
 - [INSTALL.md](INSTALL.md) — full installation, portability, and troubleshooting guide.
-- [EXPORT_AND_SETUP.md](EXPORT_AND_SETUP.md) — packaging/export notes (legacy pointer to INSTALL.md).
 - `references/workflow.md`, `references/io-spec.md`, `references/tooling.md` — deeper technical references.
