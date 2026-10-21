@@ -235,7 +235,7 @@ class OutputContractTests(unittest.TestCase):
 
         report = json.loads((job / "merge_report.json").read_text(encoding="utf-8"))
         self.assertIsInstance(report, dict)
-        self.assertEqual(report["schema"], "5")
+        self.assertEqual(report["schema"], "6")
 
     def test_resume_and_merge_only_repair_stale_absolute_cached_docling(self) -> None:
         pdf = self.root / "repair.pdf"

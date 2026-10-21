@@ -341,7 +341,7 @@ class PipelineTests(unittest.TestCase):
         self.assertGreater(merged.index("This prose must remain outside"), merged.rindex("```"))
 
         code_report = report["code_blocks"]
-        self.assertEqual(report["schema"], "5")
+        self.assertEqual(report["schema"], "6")
         self.assertEqual(code_report["replaced"], 1)
         self.assertEqual(code_report["fallback"], 0)
         self.assertEqual(code_report["blocks"][0]["pages"], [10, 11, 12])
@@ -878,7 +878,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual((self.counter_dir / "docling").read_text(), "1")
         job_dir = next((self.root / "outputs").iterdir())
         merge_report = json.loads((job_dir / "merge_report.json").read_text())
-        self.assertEqual(merge_report["schema"], "5")
+        self.assertEqual(merge_report["schema"], "6")
         self.assertIn("ocr_audit", merge_report)
         self.assertTrue((job_dir / "ocr_audit.json").is_file())
         timings = json.loads((job_dir / "timings.json").read_text())
@@ -892,6 +892,50 @@ class PipelineTests(unittest.TestCase):
         skipped_report = json.loads((job_dir / "merge_report.json").read_text())
         self.assertEqual(skipped_report["ocr_audit"]["status"], "skipped")
         self.assertTrue((job_dir / "ocr_audit_review.json").is_file())
+
+    def test_missing_markers_block_strict_success_when_audit_skipped(self):
+        pdf = self.root / "missing.pdf"
+        pdf.write_bytes(b"%PDF-1.7 synthetic")
+        with patch.object(pipeline, "find_audit_interpreter", return_value=None):
+            self.assertEqual(self.run_pipeline(pdf, "--skip-ocr-audit"), 0)
+            job = next((self.root / "outputs").iterdir())
+            (job / "nougat.mmd").write_text("Before\n[MISSING_PAGE_EMPTY:16]\n[MISSING_PAGE_FAIL:25]\nAfter")
+            self.assertEqual(self.run_pipeline(pdf, "--merge-only", "--skip-ocr-audit", "--require-complete"), 2)
+            report = json.loads((job / "merge_report.json").read_text())
+            mapping = json.loads((job / "page_map.json").read_text())
+            text = (job / "missing.md").read_text()
+            self.assertTrue(report["validation"]["ok"])
+            self.assertEqual(report["status"], "review_required")
+            self.assertEqual(report["completeness"]["status"], "incomplete")
+            self.assertEqual(report["completeness"]["missing_pages"], [16, 25])
+            self.assertIn("**Conversion requires review:**", text)
+            for marker in mapping["missing_markers"]:
+                a, b = marker["span"]
+                self.assertTrue(text[a:b].startswith("[MISSING_PAGE_"))
+            self.assertEqual(mapping["final_md_sha256"], hashlib.sha256(text.encode()).hexdigest())
+            self.assertEqual(self.run_pipeline(pdf, "--merge-only", "--skip-ocr-audit", "--require-complete"), 2)
+            self.assertEqual((job / "missing.md").read_text(), text)
+            self.assertEqual((self.counter_dir / "nougat").read_text(), "1")
+            self.assertEqual((self.counter_dir / "docling").read_text(), "1")
+            base = (job / "recovery" / "base.md").read_text()
+            replacements = []
+            for number, kind in [(16, "EMPTY"), (25, "FAIL")]:
+                original = f"[MISSING_PAGE_{kind}:{number}]"
+                start = base.index(original)
+                replacements.append({"page": number, "original": original,
+                    "span": [start, start + len(original)], "replacement": f"Verified synthetic page {number}.",
+                    "method": "transcription", "verification": {"source_page": number,
+                    "visually_verified": True, "evidence": "Synthetic verification fixture."}})
+            ledger = self.root / "recovery.json"
+            ledger.write_text(json.dumps({"schema": "1", "pdf_sha256": pipeline.sha256_file(pdf),
+                "base_md_sha256": hashlib.sha256(base.encode()).hexdigest(), "replacements": replacements}))
+            self.assertEqual(self.run_pipeline(pdf, "--merge-only", "--skip-ocr-audit",
+                "--require-complete", "--recovery-ledger", str(ledger)), 2)
+            recovered = (job / "missing.md").read_text()
+            self.assertNotIn("MISSING_PAGE", recovered)
+            self.assertIn("Verified synthetic page 16", recovered)
+            # Without a readable PDF, recovery still cannot assert completeness.
+            self.assertEqual(json.loads((job / "page_map.json").read_text())["status"], "unknown")
 
     def test_audit_interpreter_discovers_windows_venv_python(self) -> None:
         nougat = self.root / "nougat.exe"

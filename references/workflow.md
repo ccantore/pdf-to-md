@@ -68,8 +68,8 @@ For example:
 
 - If Docling cannot export referenced images, the runner retries with embedded
   images. You can force the fallback with --image-mode embedded.
-- If Nougat emits many [MISSING_PAGE] markers, pass
-  --nougat-arg=--no-skipping.
+- For missing-page markers, use the bounded [page recovery workflow](recovery.md).
+  Do not rerun the entire document automatically or remove unresolved markers.
 - If a run is interrupted, rerun with --resume. Partial stage directories are
   discarded before a retry and are never treated as valid cache entries.
 - If inline matching is ambiguous, the affected figure is emitted once under
@@ -91,3 +91,7 @@ For example:
   Compile from that directory with:
 
       latexmk -pdf -halt-on-error -file-line-error <safe-stem>.tex
+
+Review `page_map.json` before accepting completeness. `validation.ok` only checks
+structure; `--require-complete` returns 2 when content is incomplete or unknown.
+See [the output contract](io-spec.md#completeness-contract-merge-6--audit-2).

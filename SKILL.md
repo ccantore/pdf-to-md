@@ -60,8 +60,8 @@ conversion, report review, and PDF compilation, see the
 
 The checked-in reference conversion is
 [examples/eric-sims-quantitative-rbc](examples/eric-sims-quantitative-rbc/README.md).
-It shows the merged Markdown, figures, merge report, and OCR-audit artifacts
-this skill should produce. The source PDF is not stored in the repository.
+It shows a historical conversion with legacy report schemas; regenerate its
+merge reports to use the current completeness contract. The source PDF is not stored in the repository.
 
 ## Outputs
 
@@ -74,6 +74,8 @@ Each PDF gets a directory named <safe-stem>-<content-hash> containing:
     docling_decoded.md
     figures/
     <safe-stem>.md
+    recovery/base.md
+    page_map.json
     merge_report.json
     ocr_audit.json
     ocr_audit.md
@@ -117,12 +119,12 @@ Optional LaTeX output is created with --to-latex when Pandoc is installed.
   default. It uses the PDF text layer and character boxes plus cached Docling
   caption/footnote evidence; it never edits content or starts another OCR
   pass. Use `--skip-ocr-audit` only when the check is intentionally disabled.
-- `ocr_audit.json` (audit schema 1) records clear/review-required status,
+- `ocr_audit.json` (audit schema 2) records clear/review-required status,
   per-page coverage, bounded substitutions, confidence, snippets, context, and
   coverage limitations. `ocr_audit.md` is the concise review view, and
   `ocr_audit_review.json` preserves human classifications across merge-only
   reruns.
-- `merge_report.json` (merge schema 5) records per-code-block status, page and
+- `merge_report.json` (merge schema 6) records per-code-block status, page and
   line ranges, replacement counts and fallback reasons, plus figure placement,
   footnote reconstruction, structural validation, and an OCR-audit summary.
   Structural `validation.ok` remains independent of nonfatal audit findings.
@@ -132,9 +134,9 @@ Optional LaTeX output is created with --to-latex when Pandoc is installed.
   as `source_matches` or `false_positive` with the resolver in
   `scripts/audit_ocr.py`; use `confirmed_extraction_error` for a finding that
   was visually confirmed and repaired. Batch confirmed corrections, then rerun
-  with `--merge-only` and the original merge/LaTeX options. Finish when no
-  active findings remain, while reporting any `full`, `partial`, or
-  `unavailable` coverage limitations.
+  with `--merge-only` and the original merge/LaTeX options. Finish by reporting completeness separately from active findings and text-layer
+  coverage. Suppressed findings are not confirmed extraction errors, and a clear
+  symbol audit does not establish visual fidelity.
 - Before LaTeX output is written, the runner checks for unresolved local assets,
   staging paths, formula placeholders, and unsupported raw Unicode for the
   documented pdfLaTeX route, including code blocks. Intentional `∆` is covered
@@ -150,3 +152,27 @@ Optional LaTeX output is created with --to-latex when Pandoc is installed.
 - references/workflow.md: end-to-end usage and recovery.
 - references/io-spec.md: output contract and cache semantics.
 - references/tooling.md: tested constraints and hardware notes.
+
+## Completeness and verified recovery
+
+- Always inspect `merge_report.json` overall `status`, `completeness`, and
+  `page_map.json`; `validation.ok` checks structure only. Unresolved missing-page
+  markers mean incomplete conversion, even with `--skip-ocr-audit`.
+- The page map reconciles every readable PDF page against the **final merged
+  Markdown**. `complete` means all normalized source text tokens were matched;
+  it does not verify images, layout, or mathematics absent from the PDF text
+  layer. Blank/scanned pages and ambiguous mappings remain `unknown`.
+- Use `--require-complete` in automated consumers: exit 2 means incomplete or
+  unknown content, with output and reports retained. Default runs retain their
+  nonfatal review workflow. Neither mode permits an unqualified fidelity claim.
+- Before alleging an absent equation, method, or table, inspect the original
+  page and relevant appendix. Numbering gaps and unresolved references are
+  advisory; they can be external references or author numbering choices.
+- For missing pages, compare cached Docling evidence with the source page.
+  Attempt at most one targeted extraction retry per page, separately from the
+  merge. Verify any candidate against the original, including equations and
+  table cells. If necessary and feasible, transcribe from the page; otherwise
+  leave it incomplete and report the affected pages.
+- Apply verified replacements through `--recovery-ledger`, following
+  [the recovery contract](references/recovery.md). `--merge-only` never runs OCR.
+  Do not clear a marker merely to satisfy the completeness check.

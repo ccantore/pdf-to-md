@@ -18,6 +18,8 @@ source path changes.
         figures/
           figure-001.png
         <safe-stem>.md
+        recovery/base.md
+        page_map.json
         merge_report.json
         ocr_audit.json
         ocr_audit.md
@@ -46,12 +48,12 @@ The LaTeX files are optional and appear only when --to-latex is used.
   once and has a durable relative link.
 - `<safe-stem>.md` is the final merged Markdown. It must contain no absolute local
   paths, `.staging/` paths, unresolved local assets, or formula placeholders.
-- `merge_report.json` uses merge schema 5 and records per-code-block status,
+- `merge_report.json` uses merge schema 6 and records per-code-block status,
   page/line ranges, replacement counts and fallback reasons, placed/unplaced
   figure counts, footnote reconstruction, structural asset/path validation, an
   OCR-audit summary, and warnings. Treat structural validation failures as
   conversion failures; OCR findings are nonfatal review prompts.
-- `ocr_audit.json` uses audit schema 1. It records `clear` or
+- `ocr_audit.json` uses audit schema 2. It records `clear` or
   `review_required`, one coverage value (`full`, `partial`, or `unavailable`)
   per PDF page, stable finding IDs/fingerprints, optional PDF character boxes,
   content origin, finding type, confidence, extracted/reference snippets, and
@@ -76,8 +78,8 @@ adds normalized figure blocks once under `## Figures`. With explicit
 uses one monotonic, context-based alignment to choose Nougat paragraph
 boundaries. A figure with an ambiguous or low-confidence anchor is emitted
 once under `## Unplaced Figures` and a warning is recorded. Docling contributes
-figure/caption and footnote evidence while its prose, formulas, and tables are
-not transplanted. It may replace a code fence only when both prose anchors and
+figure/caption and footnote evidence; prose, formulas and tables are transplanted
+only through an explicitly verified recovery ledger. It may replace a code fence only when both prose anchors and
 Nougat's leading printed-number sequence produce a unique match. Consecutive
 Docling page blocks are joined into one balanced fence; `ˆ` and `−` are
 normalized, unambiguous underscores are repaired from Nougat identifiers, and
@@ -105,3 +107,45 @@ External-stage cache keys include the PDF content hash, profile, tool path or
 version, and stage arguments. Merge choices such as figure placement, math
 normalization, metadata, and LaTeX generation are deliberately excluded so
 they can be changed without repeating OCR.
+
+## Completeness contract (merge 6 / audit 2)
+
+`merge_report.json` separates `execution.ok`, structural `validation.ok`,
+`completeness.status`, `fidelity` (audit status, coverage and scope), and overall
+`status` (`clear` or `review_required`). Overall clear requires complete content,
+a clear audit and no numbering prompts. Audit skip/failure never establishes
+fidelity. Missing-page markers always mean incomplete, even if their page
+number is invalid or page extraction is unavailable.
+
+`page_map.json` schema 1 records the PDF hash, final Markdown hash, completeness,
+numbering diagnostics and one record per PDF page. Each record contains:
+
+- `page`: one-based PDF page number (not the printed page label).
+- `status`: complete, incomplete or unknown.
+- `final_spans`: matching half-open character offsets in the final UTF-8-decoded
+  Markdown string, not byte offsets or assumed page boundaries.
+- `mapping_confidence`: unique_anchor, explicit_missing_marker or unavailable.
+- `matched_text_fraction`, `missing_markers`, `fidelity_coverage`, and `recovery`.
+
+Complete requires every normalized PDF text token to match. A bounded deletion
+of at least five tokens or an explicit missing marker means incomplete. Other
+mismatches and unavailable/ambiguous evidence remain unknown. Text-layer `full`
+coverage is not visual verification; the report states this limitation.
+Extraction failure produces an unknown page map with an error; explicit markers
+still make it incomplete. A warning is inserted after any YAML front matter
+when content is incomplete or unknown. Its offsets and hash describe the
+actual delivered artifact.
+
+Audit schema 2 compares the final body and records its hash, completeness,
+alignment coverage, and text-layer fidelity coverage separately. Review ledger
+schema 1 is retained; fingerprints bind the PDF, origin, reference, extracted
+content and surrounding context, so affected changes reactivate findings.
+Legacy reports are recomputed from cached OCR, without changing OCR cache keys.
+A legacy resolution cannot establish completeness.
+
+`--require-complete` returns 2 after output/report generation for incomplete or
+unknown content; ordinary successful execution remains exit 0. Structural and
+execution failures keep their existing error behavior. This flag checks content
+completeness only, not whether every audit prompt has been resolved.
+
+See [recovery](recovery.md) for the optional verified replacement ledger.

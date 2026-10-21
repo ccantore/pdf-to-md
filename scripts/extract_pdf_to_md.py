@@ -21,6 +21,8 @@ from difflib import SequenceMatcher
 from typing import Any
 from urllib.parse import unquote
 
+from completeness import apply_recoveries, digest, fallback, WARNING
+
 from check_deps import launcher_interpreter, package_version_from_command
 from parse_docling_figures import decode_docling_markdown, normalize_docling_markdown
 from prepare_md_for_latex import fix_fences, validate_latex_input
@@ -30,7 +32,7 @@ from prepare_md_for_latex import pdftex_header_includes
 V2_VERSION = "2"
 # This changes merge/normalization behavior only.  It deliberately does not
 # participate in the expensive Nougat/Docling cache keys.
-MERGE_SCHEMA_VERSION = "5"
+MERGE_SCHEMA_VERSION = "6"
 DOCLING_CODE_SCHEMA_VERSION = "1"
 PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
     "fast": {
@@ -214,6 +216,7 @@ def scrub_report_files(job_dir: Path, output_root: Path, pdf_path: Path) -> None
     replacements.sort(key=lambda item: len(item[0]), reverse=True)
     for name in (
         "merge_report.json",
+        "page_map.json",
         "ocr_audit.json",
         "ocr_audit.md",
         "ocr_audit_review.json",
@@ -1403,7 +1406,7 @@ def audit_execution_failure_report(pdf_path: Path, message: str) -> dict[str, An
     except OSError:
         input_hash = None
     return {
-        "schema": "1",
+        "schema": "2",
         "status": "review_required",
         "pdf_sha256": input_hash,
         "coverage": {},
@@ -2213,6 +2216,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Keep embedded Docling images in docling.md instead of decoding them.",
     )
+    parser.add_argument("--require-complete", action="store_true", help="Exit 2 after writing reports if completeness is incomplete or unknown.")
+    parser.add_argument("--recovery-ledger", type=Path, help="Verified, hash-bound replacements for the merged body.")
     parser.add_argument("--merge-only", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--skip-ocr-audit",
@@ -2473,7 +2478,59 @@ def main() -> int:
     if metadata_block:
         combined_text = metadata_block + combined_text.lstrip()
     combined_text = combined_text.rstrip() + "\n"
+    (job_dir / "recovery").mkdir(exist_ok=True)
+    atomic_write_text(job_dir / "recovery" / "base.md", combined_text)
+    recovery_ledger = load_manifest(args.recovery_ledger) if args.recovery_ledger else None
+    if args.recovery_ledger and not recovery_ledger:
+        raise ValueError("Recovery ledger is missing or invalid")
+    combined_text, recoveries = apply_recoveries(combined_text, sha256_file(pdf_path), recovery_ledger)
     atomic_write_text(combined_md, combined_text)
+    page_map = fallback(combined_text, sha256_file(pdf_path), "No PDF text-layer interpreter available")
+    interpreter = find_audit_interpreter(audit_nougat_cmd, manifest)
+    page_map_path = job_dir / "page_map.json"
+    page_map_path.unlink(missing_ok=True)
+    if interpreter:
+        try:
+            result = subprocess.run([interpreter, str(Path(__file__).with_name("completeness.py")),
+                                     str(pdf_path), str(combined_md), str(page_map_path)],
+                                    check=False, capture_output=True, text=True)
+            candidate = load_manifest(page_map_path) if result.returncode == 0 else {}
+            if candidate.get("status") in {"complete", "incomplete", "unknown"} and isinstance(candidate.get("pages"), list):
+                page_map = candidate
+            else:
+                page_map["error"] = "Page reconciliation produced no valid report"
+        except OSError as exc:
+            page_map["error"] = f"Page reconciliation could not execute: {exc}"
+    if page_map["pages"] and any(r["page"] not in {p["page"] for p in page_map["pages"]} for r in recoveries):
+        raise ValueError("Recovery names a page outside the source PDF")
+    page_map["recoveries"] = recoveries
+    for page in page_map["pages"]:
+        page["recovery"] = [r for r in recoveries if r["page"] == page["page"]]
+    if page_map["status"] != "complete":
+        warning = WARNING.format(status=page_map["status"])
+        # Keep YAML front matter first; insert the warning after metadata.
+        offset = len(metadata_block) if metadata_block else 0
+        combined_text = combined_text[:offset] + warning + combined_text[offset:]
+        for page in page_map["pages"]:
+            for span in page["final_spans"]:
+                span[:] = [value + len(warning) if value >= offset else value for value in span]
+        seen_markers = set()
+        for marker in page_map["missing_markers"] + [m for page in page_map["pages"] for m in page["missing_markers"]]:
+            if id(marker) in seen_markers:
+                continue
+            seen_markers.add(id(marker))
+            marker["span"] = [value + len(warning) if value >= offset else value for value in marker["span"]]
+        for diagnostic in page_map["numbering_diagnostics"]:
+            if "span" in diagnostic:
+                diagnostic["span"] = [value + len(warning) if value >= offset else value for value in diagnostic["span"]]
+        merge_report["warnings"].append("Content completeness is " + page_map["status"] + "; see page_map.json")
+        atomic_write_text(combined_md, combined_text)
+    page_map["final_md_sha256"] = digest(combined_text)
+    write_json(page_map_path, page_map)
+    merge_report["completeness"] = {"status": page_map["status"], "page_map": "page_map.json",
+                                    "missing_pages": sorted({m["page"] for m in page_map["missing_markers"]})}
+    merge_report["numbering_diagnostics"] = page_map["numbering_diagnostics"]
+    merge_report["execution"] = {"ok": True}
     artifact_paths = [docling_md, combined_md]
     decoded_path = job_dir / "docling_decoded.md"
     if decoded_path.exists():
@@ -2488,6 +2545,9 @@ def main() -> int:
     }
     write_json(job_dir / "merge_report.json", merge_report)
     if not merge_report["validation"]["ok"]:
+        merge_report["status"] = "review_required"
+        merge_report["execution"] = {"ok": False, "stage": "structural_validation"}
+        write_json(job_dir / "merge_report.json", merge_report)
         scrub_report_files(job_dir, out_root, pdf_path)
         details = "; ".join(
             f"{name}: {', '.join(errors)}" for name, errors in validation_errors.items() if errors
@@ -2515,6 +2575,13 @@ def main() -> int:
         audit_report = run_ocr_audit(pdf_path, job_dir, combined_md, audit_nougat_cmd, manifest)
         audit_duration = time.perf_counter() - audit_started
         merge_report["ocr_audit"] = audit_report_summary(audit_report)
+    write_json(job_dir / "merge_report.json", merge_report)
+    merge_report["fidelity"] = {"status": merge_report["ocr_audit"]["status"],
+                                "coverage": merge_report["ocr_audit"].get("coverage", {}),
+                                "scope": page_map["coverage_scope"]}
+    merge_report["status"] = "clear" if (page_map["status"] == "complete"
+        and merge_report["ocr_audit"]["status"] == "clear"
+        and not page_map["numbering_diagnostics"]) else "review_required"
     write_json(job_dir / "merge_report.json", merge_report)
     manifest["merge_schema"] = MERGE_SCHEMA_VERSION
     manifest["updated_at"] = now_utc()
@@ -2571,8 +2638,8 @@ def main() -> int:
         if legacy.resolve() not in active_outputs:
             legacy.unlink(missing_ok=True)
     scrub_report_files(job_dir, out_root, pdf_path)
-    print(f"Wrote merged Markdown to {combined_md}")
-    return 0
+    print(f"Wrote merged Markdown to {combined_md} (completeness: {page_map['status']})")
+    return 2 if args.require_complete and page_map["status"] != "complete" else 0
 
 
 if __name__ == "__main__":

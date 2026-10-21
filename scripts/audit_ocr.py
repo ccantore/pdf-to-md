@@ -16,6 +16,7 @@ import json
 import math
 import re
 import sys
+from completeness import reconcile, digest
 from collections import defaultdict
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -28,7 +29,7 @@ except ImportError:  # pragma: no cover - exercised through the runner fallback.
     pdfium = None  # type: ignore[assignment]
 
 
-AUDIT_SCHEMA_VERSION = "1"
+AUDIT_SCHEMA_VERSION = "2"
 REVIEW_SCHEMA_VERSION = "1"
 RESOLUTION_STATUSES = (
     "confirmed_extraction_error",
@@ -864,7 +865,7 @@ def align_pages(pages: Sequence[PdfPage], nougat_tokens: Sequence[Token]) -> tup
             continue
         anchors[page.number] = anchor
         cursor = anchor.nougat_token_index + anchor.width
-        coverage[page.number] = "full"
+        coverage[page.number] = "partial"  # An anchor is alignment evidence only.
 
     ordered = [(page.number, anchors[page.number]) for page in pages if page.number in anchors]
     alignments: list[PageAlignment] = []
@@ -1381,6 +1382,8 @@ def human_report(report: dict[str, Any]) -> str:
     execution = report.get("execution", {})
     if isinstance(execution, dict) and not execution.get("ok", True):
         lines.extend([f"Audit execution: failed — {execution.get('error', 'unknown error')}", ""])
+    lines.extend([f"Content completeness: {report.get('completeness', 'unknown')}",
+                  "Coverage describes comparison with the PDF text layer, not visual fidelity.", ""])
     coverage = report.get("coverage", {})
     if isinstance(coverage, dict):
         lines.append("Coverage by PDF page:")
@@ -1449,31 +1452,35 @@ def audit_document(
     review_path: Path,
 ) -> dict[str, Any]:
     pdf_hash = sha256_file(pdf_path)
-    nougat_text = nougat_path.read_text(encoding="utf-8")
     combined_text = combined_path.read_text(encoding="utf-8")
     docling_text = docling_path.read_text(encoding="utf-8") if docling_path and docling_path.is_file() else ""
     pages = extract_pdf_pages(pdf_path)
-    normalized_nougat = normalize_with_mapping(nougat_text)
-    nougat_tokens = semantic_tokens(normalized_nougat)
-    alignments, coverage = align_pages(pages, nougat_tokens)
+    # Compare the delivered artifact; raw Nougat remains diagnostic input only.
+    page_map = reconcile(pages, combined_text, pdf_hash)
+    normalized_final = normalize_with_mapping(combined_text)
+    final_tokens = semantic_tokens(normalized_final)
+    alignments, _ = align_pages(pages, final_tokens)
+    coverage = {p["page"]: p["fidelity_coverage"] for p in page_map["pages"]}
 
     findings: list[dict[str, Any]] = []
     page_by_number = {page.number: page for page in pages}
     for alignment in alignments:
         page = page_by_number[alignment.page_number]
+        if any(m["page"] == page.number for m in page_map["missing_markers"]):
+            continue
         if code_like_page(page):
             coverage[page.number] = "partial"
             continue
         findings.extend(
             compare_token_sequences(
                 page.tokens,
-                nougat_tokens[alignment.nougat_start:alignment.nougat_end],
+                final_tokens[alignment.nougat_start:alignment.nougat_end],
                 page.text,
-                nougat_text,
+                combined_text,
                 page.number,
-                "nougat_body",
+                "final_body",
                 formula_spans(page.text),
-                formula_spans(nougat_text),
+                formula_spans(combined_text),
                 alignment.anchor.width,
                 include_bbox=True,
             )
@@ -1483,8 +1490,11 @@ def audit_document(
     if evidence:
         findings.extend(audit_docling_evidence(evidence, pages))
 
-    limitations: list[str] = []
-    unavailable_pages = [page.number for page in pages if coverage.get(page.number) == "unavailable"]
+    limitations: list[str] = [page_map["coverage_scope"]]
+    unavailable_pages = [page.number for page in pages if not page.tokens]
+    unmapped_pages = [page.number for page in pages if page.tokens and coverage.get(page.number) == "unavailable"]
+    if unmapped_pages:
+        limitations.append("Pages without usable final-artifact alignment: " + ", ".join(map(str, unmapped_pages)) + ".")
     code_pages = [page.number for page in pages if code_like_page(page)]
     partial_pages = [
         page.number
@@ -1500,7 +1510,7 @@ def audit_document(
         limitations.append("Mathematical coverage is limited on pages without a usable PDF text layer.")
     if partial_pages:
         limitations.append(
-            "Some pages had text but no unique exact Nougat anchor: "
+            "Some pages had text but incomplete final-artifact text-layer coverage: "
             + ", ".join(str(page) for page in partial_pages)
             + "."
         )
@@ -1511,17 +1521,19 @@ def audit_document(
             + "."
         )
     if unavailable_pages and docling_text:
-        fallback = audit_docling_fallback(docling_text, nougat_text, pages, unavailable_pages)
+        fallback = audit_docling_fallback(docling_text, combined_text, pages, unavailable_pages)
         if fallback:
+            for finding in fallback:
+                finding["content_origin"] = "final_body"
             findings.extend(fallback)
             limitations.append("Docling was used as a lower-confidence prose reference where page markers allowed strong alignment.")
         else:
             limitations.append("Cached Docling prose had no strong page-marked anchor for fallback comparison.")
-    if not any(_is_math_token(token, nougat_text, formula_spans(nougat_text)) for token in nougat_tokens):
+    if not any(_is_math_token(token, combined_text, formula_spans(combined_text)) for token in final_tokens):
         limitations.append("No mathematical content was safely aligned; mathematical coverage is limited.")
 
     # De-duplicate overlapping findings produced by a page comparison and a
-    # Docling evidence comparison.  Keep the canonical Nougat-origin finding.
+    # Docling evidence comparison.  Prefer the final-body finding.
     unique: dict[tuple[Any, ...], dict[str, Any]] = {}
     for finding in findings:
         key = (
@@ -1532,7 +1544,7 @@ def audit_document(
             _finding_location_key(finding),
         )
         previous = unique.get(key)
-        if previous is None or previous.get("origin") != "nougat_body" and finding.get("origin") == "nougat_body":
+        if previous is None or previous.get("origin") != "final_body" and finding.get("origin") == "final_body":
             unique[key] = finding
     findings = list(unique.values())
     for finding in findings:
@@ -1553,7 +1565,12 @@ def audit_document(
     report_coverage = {str(page): status for page, status in sorted(coverage.items())}
     report: dict[str, Any] = {
         "schema": AUDIT_SCHEMA_VERSION,
-        "status": "review_required" if active_count or not pages else "clear",
+        "status": "review_required" if active_count or page_map["status"] != "complete" or page_map["numbering_diagnostics"] or any(v != "full" for v in coverage.values()) else "clear",
+        "final_md_sha256": digest(combined_text),
+        "completeness": page_map["status"],
+        "numbering_diagnostics": page_map["numbering_diagnostics"],
+        "alignment_coverage": {str(p["page"]): p["mapping_confidence"] for p in page_map["pages"]},
+        "coverage_scope": page_map["coverage_scope"],
         "pdf_sha256": pdf_hash,
         "pdf_pages": len(pages),
         "coverage": report_coverage,
@@ -1632,7 +1649,9 @@ def resolve_finding(
     applied, suppressed = apply_review_ledger(report_findings, ledger)
     report["findings"] = applied
     active = sum(1 for item in report["findings"] if item.get("active", True))
-    report["status"] = "review_required" if active or not report.get("execution", {}).get("ok", True) else "clear"
+    report["status"] = "review_required" if (active or not report.get("execution", {}).get("ok", True)
+        or report.get("completeness", "unknown") != "complete" or report.get("numbering_diagnostics")
+        or any(v != "full" for v in report.get("coverage", {}).values())) else "clear"
     summary = report.setdefault("summary", {})
     summary["active_findings"] = active
     summary["suppressed_findings"] = suppressed

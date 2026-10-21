@@ -159,11 +159,12 @@ class OcrAuditTests(unittest.TestCase):
 
             with patch.object(audit, "extract_pdf_pages", return_value=[self.fake_page(pdf_text, 1)]):
                 same = audit.run_audit(pdf, nougat, None, combined, root)
-            self.assertEqual(same["status"], "clear")
+            self.assertEqual(same["status"], "review_required")
+            self.assertEqual(same["completeness"], "unknown")
             self.assertFalse(same["findings"][0]["active"])
 
             changed = r"Context before the equation is \sigma_\nu^{-2} and the context after agrees."
-            nougat.write_text(changed, encoding="utf-8")
+            # A final-only edit must invalidate the affected resolution.
             combined.write_text(changed, encoding="utf-8")
             with patch.object(audit, "extract_pdf_pages", return_value=[self.fake_page(pdf_text, 1)]):
                 changed_report = audit.run_audit(pdf, nougat, None, combined, root)
@@ -238,13 +239,13 @@ class OcrAuditTests(unittest.TestCase):
             pdf.write_bytes(b"synthetic scan")
             nougat.write_text(extracted, encoding="utf-8")
             docling.write_text(reference, encoding="utf-8")
-            combined.write_text(reference, encoding="utf-8")
+            combined.write_text(extracted, encoding="utf-8")
             page = audit.PdfPage(1, "", [], (100.0, 100.0), [], [])
             with patch.object(audit, "extract_pdf_pages", return_value=[page]):
                 report = audit.run_audit(pdf, nougat, docling, combined, root)
         self.assertEqual(report["coverage"]["1"], "unavailable")
         self.assertEqual(report["findings"][0]["origin"], "docling_prose_fallback")
-        self.assertEqual(report["findings"][0]["content_origin"], "nougat_body")
+        self.assertEqual(report["findings"][0]["content_origin"], "final_body")
         self.assertEqual(report["findings"][0]["type"], "prose")
         self.assertLessEqual(report["findings"][0]["confidence"], 0.74)
         self.assertEqual(report["findings"][0]["confidence_basis"], "lower-confidence-docling-fallback")
