@@ -18,11 +18,31 @@ def page(text, number=1):
 class CompletenessTests(unittest.TestCase):
     def test_missing_markers_override_matching_anchors(self):
         text = 'A stable and uniquely identifiable paragraph with meaningful information.'
-        for kind in ['EMPTY', 'FAIL']:
+        for kind in ['EMPTY', 'FAIL', 'POST']:
             report = comp.reconcile([page(text, 25)], text + f'\n[MISSING_PAGE_{kind}:25]')
             self.assertEqual(report['status'], 'incomplete')
             self.assertEqual(report['pages'][0]['fidelity_coverage'], 'unavailable')
             self.assertEqual(report['pages'][0]['final_spans'], [])
+
+    def test_bare_post_marker_and_unsupported_characters_block_clear_audit(self):
+        anchor = 'A stable uniquely identifiable paragraph with meaningful information.'
+        for source, final in [(anchor, anchor + '\n[MISSING_PAGE_POST]'),
+                              (anchor + ' The value is x ∫ y.', anchor + ' The value is x y.'),
+                              (anchor + ' 中文内容', anchor)]:
+            with self.subTest(source=source, final=final), tempfile.TemporaryDirectory() as tmp:
+                pages = [page(source)]
+                result = comp.reconcile(pages, final)
+                self.assertNotEqual(result['status'], 'complete')
+                self.assertNotEqual(result['pages'][0]['fidelity_coverage'], 'full')
+                root = Path(tmp)
+                pdf, raw, merged = root/'paper.pdf', root/'nougat.mmd', root/'paper.md'
+                pdf.write_bytes(b'synthetic')
+                raw.write_text(source)
+                merged.write_text(final)
+                with patch.object(audit, 'extract_pdf_pages', return_value=pages):
+                    report = audit.run_audit(pdf, raw, None, merged, root)
+                self.assertEqual(report['status'], 'review_required')
+        self.assertIsNone(comp.missing_markers('[MISSING_PAGE_POST]')[0]['page'])
 
     def test_exact_text_and_offsets(self):
         source = 'A stable uniquely identifiable paragraph with meaningful information.'
@@ -32,6 +52,11 @@ class CompletenessTests(unittest.TestCase):
         start, end = report['pages'][0]['final_spans'][0]
         self.assertEqual(text[start:end], source.rstrip('.'))
         self.assertEqual(report['final_md_sha256'], comp.digest(text))
+
+    def test_supported_greek_normalization_remains_complete(self):
+        source = 'A stable uniquely identifiable paragraph with meaningful information. α = 2'
+        final = source.replace('α', r'\alpha')
+        self.assertEqual(comp.reconcile([page(source)], final)['status'], 'complete')
 
     def test_anchor_alone_does_not_prove_completeness(self):
         anchor = 'A stable uniquely identifiable paragraph with meaningful information.'
@@ -156,12 +181,14 @@ class CompletenessTests(unittest.TestCase):
 
     def test_recovery_rejects_unverified_ambiguous_and_wrong_page(self):
         text = '[MISSING_PAGE_EMPTY:2]'
-        for change in ['unverified', 'span', 'page', 'empty', 'duplicate']:
+        for change in ['unverified', 'span', 'page', 'empty', 'duplicate', 'post', 'numbered_post']:
             ledger = self.ledger(text)
             item = ledger['replacements'][0]
             if change == 'unverified': item['verification']['visually_verified'] = False
             if change == 'span': item['span'] = [0, 1]
             if change == 'page': item['page'] = 3
+            if change == 'post': item['replacement'] = '[MISSING_PAGE_POST]'
+            if change == 'numbered_post': item['replacement'] = '[MISSING_PAGE_POST:2]'
             if change == 'empty': item['replacement'] = ''
             if change == 'duplicate': ledger['replacements'].append(dict(item))
             with self.assertRaises(ValueError): comp.apply_recoveries(text, 'hash', ledger)

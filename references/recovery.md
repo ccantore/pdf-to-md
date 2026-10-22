@@ -17,7 +17,7 @@ source files, page images and ledgers in the local job area.
    and what was checked. Uncertain content stays incomplete; report it honestly.
 4. Construct the ledger below against the merged body **before recovery and
    before the generated completeness warning**, including any YAML metadata.
-   Each merge writes that exact base to `recovery/base.md`. Hash its UTF-8
+   Each accepted merge writes that exact base to `recovery/base.md`. Hash its UTF-8
    contents. `original` must
    occur exactly once and `span` must identify its half-open character offsets.
 5. Rerun the same merge command with `--recovery-ledger /local/recovery.json`.
@@ -59,3 +59,10 @@ Numbering diagnostics are advisory. Check appendix numbering and external
 references before inferring absence. A reviewer must verify the original page
 before claiming an equation, method or table is absent. A suppressed audit
 finding is not evidence of an extraction error.
+
+Recovery candidates and page maps are staged before publication. A rejected
+ledger preserves the previous delivered Markdown, page map and audit/merge
+reports. The source PDF must be readable so each recovery page can be checked
+against its page count; unavailable page membership fails closed. A bare
+`[MISSING_PAGE_POST]` has unknown page attribution and cannot be consumed by a
+page-specific ledger replacement.

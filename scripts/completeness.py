@@ -9,11 +9,12 @@ import argparse
 import hashlib
 import json
 import re
+import unicodedata
 from collections import Counter, defaultdict
 from difflib import SequenceMatcher
 from pathlib import Path
 
-MISSING = re.compile(r"\[MISSING_PAGE_(EMPTY|FAIL)\s*:\s*(\d+)\]")
+MISSING = re.compile(r"\[MISSING_PAGE_(EMPTY|FAIL|POST)(?:\s*:\s*(\d+))?\]")
 WARNING = "> **Conversion requires review:** content completeness is {status}. See `page_map.json` and `merge_report.json`.\n\n"
 
 
@@ -22,7 +23,7 @@ def digest(text):
 
 
 def missing_markers(text):
-    return [{"page": int(m[2]), "kind": m[1].lower(), "span": [m.start(), m.end()]} for m in MISSING.finditer(text)]
+    return [{"page": int(m[2]) if m[2] else None, "kind": m[1].lower(), "span": [m.start(), m.end()]} for m in MISSING.finditer(text)]
 
 
 def apply_recoveries(text, pdf_hash, ledger):
@@ -147,7 +148,7 @@ def reconcile(pages, text, pdf_hash=None, recoveries=()):
     for page in pages:
         mapping, bounded = {}, []
         alignment = by_page.get(page.number)
-        if alignment and not any(m['page'] == page.number for m in markers):
+        if alignment and not any(m['page'] in {None, page.number} for m in markers):
             offset = alignment.nougat_start
             matcher = SequenceMatcher(None, [t.value for t in page.tokens],
                                       values[offset:alignment.nougat_end], autojunk=False)
@@ -165,7 +166,7 @@ def reconcile(pages, text, pdf_hash=None, recoveries=()):
     # resolve competing relocation proposals together as well.
     relocated = [dict(mapping) for mapping in mappings]
     for index, page in enumerate(pages):
-        if page.number not in by_page or any(m['page'] == page.number for m in markers):
+        if page.number not in by_page or any(m['page'] in {None, page.number} for m in markers):
             continue
         for start, end in _unmatched_runs(len(page.tokens), mappings[index]):
             if end - start < 5:
@@ -181,11 +182,19 @@ def reconcile(pages, text, pdf_hash=None, recoveries=()):
     available = Counter(value for index, value in enumerate(values) if index not in used)
     records = []
     for index, page in enumerate(pages):
-        marks = [m for m in markers if m['page'] == page.number]
+        marks = [m for m in markers if m['page'] in {None, page.number}]
         mapping = mappings[index]
+        # A tokenizer match fraction cannot account for characters it discards.
+        # Fail closed on meaningful normalized symbols outside its vocabulary.
+        normalized = audit.normalize_with_mapping(page.text)
+        represented = {i for match in audit.SEMANTIC_TOKEN_RE.finditer(normalized.text)
+                       for i in range(match.start(), match.end())}
+        unsupported = sorted({char for i, char in enumerate(normalized.text)
+                              if i not in represented and unicodedata.category(char)[0] in {'L', 'N', 'M', 'S'}
+                              and not any(a <= normalized.spans[i][0] < b for a, b in page.ignored_ranges)})
         record = {'page': page.number, 'status': 'unknown', 'mapping_confidence': 'unavailable',
                   'final_spans': [], 'missing_markers': marks, 'matched_text_fraction': 0.0,
-                  'fidelity_coverage': 'unavailable',
+                  'fidelity_coverage': 'unavailable', 'uncompared_characters': unsupported,
                   'recovery': [r for r in recoveries if r['page'] == page.number]}
         if page.number in by_page and not marks:
             record['matched_text_fraction'] = round(len(mapping) / max(1, len(page.tokens)), 4)
@@ -199,7 +208,7 @@ def reconcile(pages, text, pdf_hash=None, recoveries=()):
                     record['final_spans'].append([tokens[final].start, tokens[final].end])
                 previous = final
             record['fidelity_coverage'] = 'partial'
-            if len(mapping) == len(page.tokens) and page.tokens:
+            if len(mapping) == len(page.tokens) and page.tokens and not unsupported:
                 record['status'] = 'complete'
                 record['mapping_confidence'] = 'unique_anchor'
                 if not audit.code_like_page(page):
@@ -213,8 +222,9 @@ def reconcile(pages, text, pdf_hash=None, recoveries=()):
                 if remaining and not occurrences(needle) and Counter(remaining) - available:
                     record['status'] = 'incomplete'
         if marks:
-            record['status'] = 'incomplete'
-            record['mapping_confidence'] = 'explicit_missing_marker'
+            attributed = any(m['page'] == page.number for m in marks)
+            record['status'] = 'incomplete' if attributed else 'unknown'
+            record['mapping_confidence'] = 'explicit_missing_marker' if attributed else 'unattributed_missing_marker'
         records.append(record)
     status = 'incomplete' if markers or any(r['status'] == 'incomplete' for r in records) else (
         'complete' if records and all(r['status'] == 'complete' for r in records) else 'unknown')

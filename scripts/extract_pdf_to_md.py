@@ -2478,31 +2478,38 @@ def main() -> int:
     if metadata_block:
         combined_text = metadata_block + combined_text.lstrip()
     combined_text = combined_text.rstrip() + "\n"
-    (job_dir / "recovery").mkdir(exist_ok=True)
-    atomic_write_text(job_dir / "recovery" / "base.md", combined_text)
+    recovery_base = combined_text
     recovery_ledger = load_manifest(args.recovery_ledger) if args.recovery_ledger else None
     if args.recovery_ledger and not recovery_ledger:
         raise ValueError("Recovery ledger is missing or invalid")
     combined_text, recoveries = apply_recoveries(combined_text, sha256_file(pdf_path), recovery_ledger)
-    atomic_write_text(combined_md, combined_text)
     page_map = fallback(combined_text, sha256_file(pdf_path), "No PDF text-layer interpreter available")
     interpreter = find_audit_interpreter(audit_nougat_cmd, manifest)
     page_map_path = job_dir / "page_map.json"
-    page_map_path.unlink(missing_ok=True)
-    if interpreter:
-        try:
-            result = subprocess.run([interpreter, str(Path(__file__).with_name("completeness.py")),
-                                     str(pdf_path), str(combined_md), str(page_map_path)],
-                                    check=False, capture_output=True, text=True)
-            candidate = load_manifest(page_map_path) if result.returncode == 0 else {}
-            if candidate.get("status") in {"complete", "incomplete", "unknown"} and isinstance(candidate.get("pages"), list):
-                page_map = candidate
-            else:
-                page_map["error"] = "Page reconciliation produced no valid report"
-        except OSError as exc:
-            page_map["error"] = f"Page reconciliation could not execute: {exc}"
-    if page_map["pages"] and any(r["page"] not in {p["page"] for p in page_map["pages"]} for r in recoveries):
-        raise ValueError("Recovery names a page outside the source PDF")
+    with tempfile.TemporaryDirectory(prefix="pdf-md-recovery-") as staging:
+        candidate_md = Path(staging) / "candidate.md"
+        candidate_map = Path(staging) / "page_map.json"
+        candidate_md.write_text(combined_text, encoding="utf-8")
+        if interpreter:
+            try:
+                result = subprocess.run([interpreter, str(Path(__file__).with_name("completeness.py")),
+                                         str(pdf_path), str(candidate_md), str(candidate_map)],
+                                        check=False, capture_output=True, text=True)
+                candidate = load_manifest(candidate_map) if result.returncode == 0 else {}
+                if candidate.get("status") in {"complete", "incomplete", "unknown"} and isinstance(candidate.get("pages"), list):
+                    page_map = candidate
+                else:
+                    page_map["error"] = "Page reconciliation produced no valid report"
+            except OSError as exc:
+                page_map["error"] = f"Page reconciliation could not execute: {exc}"
+    if any(r["page"] not in {p["page"] for p in page_map["pages"]} for r in recoveries):
+        raise ValueError("Recovery names a page outside the source PDF or page membership cannot be verified")
+    if recoveries:
+        recovery_errors = markdown_reference_errors(combined_text, job_dir)
+        if recovery_errors:
+            raise ValueError("Recovery failed durable-asset validation: " + "; ".join(recovery_errors))
+    (job_dir / "recovery").mkdir(exist_ok=True)
+    atomic_write_text(job_dir / "recovery" / "base.md", recovery_base)
     page_map["recoveries"] = recoveries
     for page in page_map["pages"]:
         page["recovery"] = [r for r in recoveries if r["page"] == page["page"]]
@@ -2524,11 +2531,12 @@ def main() -> int:
             if "span" in diagnostic:
                 diagnostic["span"] = [value + len(warning) if value >= offset else value for value in diagnostic["span"]]
         merge_report["warnings"].append("Content completeness is " + page_map["status"] + "; see page_map.json")
-        atomic_write_text(combined_md, combined_text)
+    atomic_write_text(combined_md, combined_text)
     page_map["final_md_sha256"] = digest(combined_text)
     write_json(page_map_path, page_map)
     merge_report["completeness"] = {"status": page_map["status"], "page_map": "page_map.json",
-                                    "missing_pages": sorted({m["page"] for m in page_map["missing_markers"]})}
+                                    "missing_pages": sorted({m["page"] for m in page_map["missing_markers"] if m["page"] is not None}),
+                                    "unattributed_missing_markers": sum(m["page"] is None for m in page_map["missing_markers"])}
     merge_report["numbering_diagnostics"] = page_map["numbering_diagnostics"]
     merge_report["execution"] = {"ok": True}
     artifact_paths = [docling_md, combined_md]

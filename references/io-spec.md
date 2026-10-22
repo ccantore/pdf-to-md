@@ -154,3 +154,12 @@ execution failures keep their existing error behavior. This flag checks content
 completeness only, not whether every audit prompt has been resolved.
 
 See [recovery](recovery.md) for the optional verified replacement ledger.
+
+Missing markers include bare and numbered Nougat `EMPTY`, `FAIL` and `POST`
+forms. Bare markers have a null page in `page_map.json`; the merge report
+counts them as `unattributed_missing_markers` separately from `missing_pages`.
+They keep the document incomplete and prevent full coverage on pages whose
+attribution is uncertain. `uncompared_characters` lists meaningful normalized
+source characters outside the comparison tokenizer (such as integral symbols
+or non-Latin text). Their presence prevents complete/full claims even when all
+recognized tokens match; original-page inspection remains necessary.

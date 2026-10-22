@@ -931,7 +931,7 @@ class PipelineTests(unittest.TestCase):
         with patch.object(pipeline, "find_audit_interpreter", return_value=None):
             self.assertEqual(self.run_pipeline(pdf, "--skip-ocr-audit"), 0)
             job = next((self.root / "outputs").iterdir())
-            (job / "nougat.mmd").write_text("Before\n[MISSING_PAGE_EMPTY:16]\n[MISSING_PAGE_FAIL:25]\nAfter")
+            (job / "nougat.mmd").write_text("Before\n[MISSING_PAGE_EMPTY:16]\n[MISSING_PAGE_FAIL:25]\n[MISSING_PAGE_POST]\n[MISSING_PAGE_POST:10]\nAfter")
             self.assertEqual(self.run_pipeline(pdf, "--merge-only", "--skip-ocr-audit", "--require-complete"), 2)
             report = json.loads((job / "merge_report.json").read_text())
             mapping = json.loads((job / "page_map.json").read_text())
@@ -939,7 +939,7 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(report["validation"]["ok"])
             self.assertEqual(report["status"], "review_required")
             self.assertEqual(report["completeness"]["status"], "incomplete")
-            self.assertEqual(report["completeness"]["missing_pages"], [16, 25])
+            self.assertEqual(report["completeness"]["missing_pages"], [10, 16, 25])
             self.assertIn("**Conversion requires review:**", text)
             for marker in mapping["missing_markers"]:
                 a, b = marker["span"]
@@ -961,13 +961,56 @@ class PipelineTests(unittest.TestCase):
             ledger = self.root / "recovery.json"
             ledger.write_text(json.dumps({"schema": "1", "pdf_sha256": pipeline.sha256_file(pdf),
                 "base_md_sha256": hashlib.sha256(base.encode()).hexdigest(), "replacements": replacements}))
-            self.assertEqual(self.run_pipeline(pdf, "--merge-only", "--skip-ocr-audit",
-                "--require-complete", "--recovery-ledger", str(ledger)), 2)
-            recovered = (job / "missing.md").read_text()
-            self.assertNotIn("MISSING_PAGE", recovered)
-            self.assertIn("Verified synthetic page 16", recovered)
-            # Without a readable PDF, recovery still cannot assert completeness.
-            self.assertEqual(json.loads((job / "page_map.json").read_text())["status"], "unknown")
+            with self.assertRaisesRegex(ValueError, "membership cannot be verified"):
+                self.run_pipeline(pdf, "--merge-only", "--skip-ocr-audit",
+                    "--require-complete", "--recovery-ledger", str(ledger))
+            self.assertEqual((job / "missing.md").read_text(), text)
+            self.assertEqual(json.loads((job / "merge_report.json").read_text()), report)
+
+    def test_invalid_recovery_preserves_delivered_artifacts(self):
+        if pipeline.find_audit_interpreter(None, {}) is None:
+            self.skipTest("PDFium runtime unavailable")
+        pdf = self.root / 'recovery.pdf'
+        source = 'A stable uniquely identifiable paragraph with meaningful information.'
+        write_text_pdf(pdf, [source])
+        self.env['FAKE_NOUGAT_MARKDOWN'] = source
+        self.assertEqual(self.run_pipeline(pdf, '--require-complete'), 0)
+        job = next((self.root / 'outputs').iterdir())
+        names = ['recovery.md', 'page_map.json', 'merge_report.json', 'ocr_audit.json', 'recovery/base.md']
+        before = {name: (job/name).read_bytes() for name in names}
+        base = (job/'recovery/base.md').read_text()
+        start = base.index(source)
+        ledger = {'schema': '1', 'pdf_sha256': pipeline.sha256_file(pdf),
+                  'base_md_sha256': pipeline.digest(base), 'replacements': [{
+                      'page': 999, 'original': source, 'replacement': 'Changed content.',
+                      'span': [start, start+len(source)], 'method': 'transcription',
+                      'verification': {'source_page': 999, 'visually_verified': True,
+                                       'evidence': 'Synthetic verification fixture.'}}]}
+        path = self.root/'ledger.json'
+        for invalid in ['page', 'stale', 'boundary', 'asset']:
+            with self.subTest(invalid=invalid):
+                candidate = json.loads(json.dumps(ledger))
+                if invalid == 'stale':
+                    candidate['base_md_sha256'] = 'stale'
+                if invalid == 'boundary':
+                    candidate['replacements'][0]['span'] = [0, 1]
+                if invalid == 'asset':
+                    candidate['replacements'][0]['page'] = 1
+                    candidate['replacements'][0]['verification']['source_page'] = 1
+                    candidate['replacements'][0]['replacement'] = '![broken](figures/nonexistent.png)'
+                path.write_text(json.dumps(candidate))
+                with self.assertRaises(ValueError):
+                    self.run_pipeline(pdf, '--merge-only', '--recovery-ledger', str(path))
+                self.assertEqual({name: (job/name).read_bytes() for name in names}, before)
+        ledger['replacements'][0]['page'] = 1
+        ledger['replacements'][0]['verification']['source_page'] = 1
+        ledger['replacements'][0]['replacement'] = source + ' Verified extra material.'
+        path.write_text(json.dumps(ledger))
+        self.assertEqual(self.run_pipeline(pdf, '--merge-only', '--recovery-ledger', str(path)), 0)
+        accepted = {name: (job/name).read_bytes() for name in names[:3]}
+        self.assertIn(b'Verified extra material.', accepted['recovery.md'])
+        self.assertEqual(self.run_pipeline(pdf, '--merge-only', '--recovery-ledger', str(path)), 0)
+        self.assertEqual({name: (job/name).read_bytes() for name in names[:3]}, accepted)
 
     def test_strict_mode_accounts_for_repeated_occurrences_in_real_pdf(self):
         interpreter = pipeline.find_audit_interpreter(None, {})
