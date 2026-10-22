@@ -124,12 +124,17 @@ numbering diagnostics and one record per PDF page. Each record contains:
 - `status`: complete, incomplete or unknown.
 - `final_spans`: matching half-open character offsets in the final UTF-8-decoded
   Markdown string, not byte offsets or assumed page boundaries.
-- `mapping_confidence`: unique_anchor, explicit_missing_marker or unavailable.
+- `mapping_confidence`: unique_anchor, ambiguous_overlap, explicit_missing_marker or unavailable.
 - `matched_text_fraction`, `missing_markers`, `fidelity_coverage`, and `recovery`.
 
-Complete requires every normalized PDF text token to match. A bounded deletion
-of at least five tokens or an explicit missing marker means incomplete. Other
-mismatches and unavailable/ambiguous evidence remain unknown. Text-layer `full`
+Complete requires every normalized PDF text token to match a distinct final
+occurrence. Overlapping page windows cannot share token ownership; unresolved
+claims remain unknown. Unmatched blocks of at least five tokens are also sought
+in unclaimed final spans, so appended captions and relocated footnotes can count
+toward completeness. Competing relocation claims are resolved jointly; ambiguous
+or shorter blocks remain unknown. A bounded deletion means incomplete only when
+no exact occurrence exists elsewhere and the remaining unclaimed tokens cannot
+account for it. An explicit missing marker always means incomplete. Text-layer `full`
 coverage is not visual verification; the report states this limitation.
 Extraction failure produces an unknown page map with an error; explicit markers
 still make it incomplete. A warning is inserted after any YAML front matter

@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import json
 import re
+from collections import Counter, defaultdict
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -99,37 +100,117 @@ def numbering_diagnostics(text):
     return prompts
 
 
+def _unmatched_runs(length, mapping):
+    start = None
+    for index in range(length + 1):
+        if index < length and index not in mapping:
+            if start is None:
+                start = index
+        elif start is not None:
+            yield start, index
+            start = None
+
+
+def _remove_shared_claims(mappings):
+    """Reject all competing owners; page iteration order must not pick a winner."""
+    owners = defaultdict(list)
+    for page_index, mapping in enumerate(mappings):
+        for source, final in mapping.items():
+            owners[final].append((page_index, source))
+    ambiguous = set()
+    for claims in owners.values():
+        if len(claims) > 1:
+            for page_index, source in claims:
+                del mappings[page_index][source]
+                ambiguous.add(page_index)
+    return ambiguous
+
+
 def reconcile(pages, text, pdf_hash=None, recoveries=()):
     import audit_ocr as audit
     tokens = audit.semantic_tokens(audit.normalize_with_mapping(text))
+    values = [t.value for t in tokens]
+    positions = defaultdict(list)
+    for index, value in enumerate(values):
+        positions[value].append(index)
+
+    def occurrences(needle):
+        return [start for start in positions[needle[0]]
+                if values[start:start + len(needle)] == needle]
+
     alignments, _ = audit.align_pages(pages, tokens)
     by_page = {a.page_number: a for a in alignments}
     markers = missing_markers(text)
-    records = []
+    mappings, deletions = [], []
+    # Alignment windows intentionally overlap. They generate proposals, not
+    # ownership: allocate final token occurrences jointly across all pages.
     for page in pages:
-        marks = [m for m in markers if m['page'] == page.number]
+        mapping, bounded = {}, []
         alignment = by_page.get(page.number)
+        if alignment and not any(m['page'] == page.number for m in markers):
+            offset = alignment.nougat_start
+            matcher = SequenceMatcher(None, [t.value for t in page.tokens],
+                                      values[offset:alignment.nougat_end], autojunk=False)
+            for block in matcher.get_matching_blocks():
+                mapping.update((block.a + i, offset + block.b + i) for i in range(block.size))
+            bounded = [(a, b) for tag, a, b, _, _ in matcher.get_opcodes()
+                       if tag == 'delete' and b-a >= 5 and a > 0 and b < len(page.tokens)]
+        mappings.append(mapping)
+        deletions.append(bounded)
+    ambiguous = _remove_shared_claims(mappings)
+    used = {final for mapping in mappings for final in mapping.values()}
+
+    # Captions and footnotes may be appended or otherwise relocated. Match
+    # sufficiently long exact blocks anywhere in the remaining artifact, then
+    # resolve competing relocation proposals together as well.
+    relocated = [dict(mapping) for mapping in mappings]
+    for index, page in enumerate(pages):
+        if page.number not in by_page or any(m['page'] == page.number for m in markers):
+            continue
+        for start, end in _unmatched_runs(len(page.tokens), mappings[index]):
+            if end - start < 5:
+                continue
+            needle = [t.value for t in page.tokens[start:end]]
+            candidates = [pos for pos in occurrences(needle)
+                          if not any(i in used for i in range(pos, pos + len(needle)))]
+            if len(candidates) == 1:
+                relocated[index].update((start+i, candidates[0]+i) for i in range(len(needle)))
+    ambiguous.update(_remove_shared_claims(relocated))
+    mappings = relocated
+    used = {final for mapping in mappings for final in mapping.values()}
+    available = Counter(value for index, value in enumerate(values) if index not in used)
+    records = []
+    for index, page in enumerate(pages):
+        marks = [m for m in markers if m['page'] == page.number]
+        mapping = mappings[index]
         record = {'page': page.number, 'status': 'unknown', 'mapping_confidence': 'unavailable',
                   'final_spans': [], 'missing_markers': marks, 'matched_text_fraction': 0.0,
                   'fidelity_coverage': 'unavailable',
                   'recovery': [r for r in recoveries if r['page'] == page.number]}
-        if alignment and not marks:
-            selected = tokens[alignment.nougat_start:alignment.nougat_end]
-            matcher = SequenceMatcher(None, [t.value for t in page.tokens], [t.value for t in selected], autojunk=False)
-            blocks = [b for b in matcher.get_matching_blocks() if b.size]
-            matched = sum(b.size for b in blocks)
-            record['matched_text_fraction'] = round(matched / max(1, len(page.tokens)), 4)
-            record['mapping_confidence'] = 'unique_anchor'
-            record['final_spans'] = [[selected[b.b].start, selected[b.b+b.size-1].end] for b in blocks]
+        if page.number in by_page and not marks:
+            record['matched_text_fraction'] = round(len(mapping) / max(1, len(page.tokens)), 4)
+            record['mapping_confidence'] = 'ambiguous_overlap' if index in ambiguous else 'unique_anchor'
+            # Coalesce only consecutive final occurrences, including relocated
+            # blocks; no span may claim another page's tokens.
+            for final in sorted(mapping.values()):
+                if record['final_spans'] and previous + 1 == final:
+                    record['final_spans'][-1][1] = tokens[final].end
+                else:
+                    record['final_spans'].append([tokens[final].start, tokens[final].end])
+                previous = final
             record['fidelity_coverage'] = 'partial'
-            # A single anchor is insufficient: require every source text token.
-            if matched == len(page.tokens) and page.tokens:
+            if len(mapping) == len(page.tokens) and page.tokens:
                 record['status'] = 'complete'
+                record['mapping_confidence'] = 'unique_anchor'
                 if not audit.code_like_page(page):
                     record['fidelity_coverage'] = 'full'
-            # A bounded multi-token deletion is direct evidence of omission.
-            for tag, a, b, c, d in matcher.get_opcodes():
-                if tag == 'delete' and b-a >= 5 and a > 0 and b < len(page.tokens):
+            # A monotonic deletion alone is not evidence of absence. Exact
+            # occurrences elsewhere, or enough unclaimed tokens in another
+            # order, require uncertainty rather than an omission claim.
+            for start, end in deletions[index]:
+                remaining = [page.tokens[i].value for i in range(start, end) if i not in mapping]
+                needle = [t.value for t in page.tokens[start:end]]
+                if remaining and not occurrences(needle) and Counter(remaining) - available:
                     record['status'] = 'incomplete'
         if marks:
             record['status'] = 'incomplete'

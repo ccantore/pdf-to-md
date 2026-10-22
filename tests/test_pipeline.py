@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -92,6 +93,37 @@ else:
     path.write_text(source, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
     return path
+
+
+def write_text_pdf(path, pages):
+    """Small real PDF fixture: exercise PDFium, not the unavailable-PDF fallback."""
+    objects = [b'<< /Type /Catalog /Pages 2 0 R >>', b'',
+               b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>']
+    kids = []
+    for text in pages:
+        page_id = len(objects) + 1
+        kids.append(f'{page_id} 0 R')
+        objects.append((f'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] '
+            f'/Resources << /Font << /F1 3 0 R >> >> /Contents {page_id+1} 0 R >>').encode())
+        commands = ['BT /F1 10 Tf 12 TL 40 740 Td']
+        for line in textwrap.wrap(text, 85):
+            escaped = line.replace('\\', '\\\\').replace('(', '\\(').replace(')', '\\)')
+            commands.append(f'({escaped}) Tj T*')
+        commands.append('ET')
+        stream = '\n'.join(commands).encode('ascii')
+        objects.append(f'<< /Length {len(stream)} >>\nstream\n'.encode() + stream + b'\nendstream')
+    objects[1] = f'<< /Type /Pages /Count {len(pages)} /Kids [{" ".join(kids)}] >>'.encode()
+    result = bytearray(b'%PDF-1.4\n')
+    offsets = [0]
+    for index, obj in enumerate(objects, 1):
+        offsets.append(len(result))
+        result.extend(f'{index} 0 obj\n'.encode() + obj + b'\nendobj\n')
+    xref = len(result)
+    result.extend(f'xref\n0 {len(objects)+1}\n0000000000 65535 f \n'.encode())
+    for offset in offsets[1:]:
+        result.extend(f'{offset:010d} 00000 n \n'.encode())
+    result.extend(f'trailer\n<< /Size {len(objects)+1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n'.encode())
+    path.write_bytes(result)
 
 
 class PipelineTests(unittest.TestCase):
@@ -936,6 +968,28 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("Verified synthetic page 16", recovered)
             # Without a readable PDF, recovery still cannot assert completeness.
             self.assertEqual(json.loads((job / "page_map.json").read_text())["status"], "unknown")
+
+    def test_strict_mode_accounts_for_repeated_occurrences_in_real_pdf(self):
+        interpreter = pipeline.find_audit_interpreter(None, {})
+        if interpreter is None:
+            self.skipTest("PDFium runtime unavailable")
+        repeated = 'These assumptions determine household savings every period.'
+        first = 'The opening section introduces aggregate production capital accumulation and firms. ' + repeated
+        end = 'The following section investigates monetary policy shocks under sticky prices.'
+        second = repeated + ' ' + end
+        pdf = self.root / 'two-pages.pdf'
+        write_text_pdf(pdf, [first, second])
+        self.env['FAKE_NOUGAT_MARKDOWN'] = first + '\n\n2\n\n' + end
+        self.assertEqual(self.run_pipeline(pdf, '--require-complete'), 2)
+        job = next((self.root / 'outputs').iterdir())
+        report = json.loads((job / 'merge_report.json').read_text())
+        self.assertEqual(report['completeness']['status'], 'unknown')
+        self.assertEqual(report['status'], 'review_required')
+        (job / 'nougat.mmd').write_text(first + '\n\n2\n\n' + second)
+        self.assertEqual(self.run_pipeline(pdf, '--merge-only', '--require-complete'), 0)
+        report = json.loads((job / 'merge_report.json').read_text())
+        self.assertEqual(report['completeness']['status'], 'complete')
+        self.assertEqual(report['status'], 'clear')
 
     def test_audit_interpreter_discovers_windows_venv_python(self) -> None:
         nougat = self.root / "nougat.exe"

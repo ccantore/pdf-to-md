@@ -64,6 +64,76 @@ class CompletenessTests(unittest.TestCase):
         self.assertEqual(report['status'], 'incomplete')
         self.assertEqual(report['missing_markers'][0]['page'], 12)
 
+    def test_neighboring_pages_cannot_reuse_a_repeated_sentence(self):
+        repeated = 'These assumptions determine household savings every period.'
+        first = 'The opening section introduces aggregate production capital accumulation and firms. ' + repeated
+        second_end = 'The following section investigates monetary policy shocks under sticky prices.'
+        pages = [page(first, 1), page(repeated + ' ' + second_end, 2)]
+        final = first + '\n\n2\n\n' + second_end
+        report = comp.reconcile(pages, final)
+        self.assertEqual(report['status'], 'unknown')
+        self.assertTrue(all(p['fidelity_coverage'] != 'full' for p in report['pages']))
+        spans = [(i, span) for i, p in enumerate(report['pages']) for span in p['final_spans']]
+        for i, (a, b) in spans:
+            for j, (c, d) in spans:
+                if i != j:
+                    self.assertFalse(a < d and b > c)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pdf, raw, merged = root/'paper.pdf', root/'nougat.mmd', root/'paper.md'
+            pdf.write_bytes(b'synthetic')
+            raw.write_text(first + '\n' + repeated + ' ' + second_end)
+            merged.write_text(final)
+            with patch.object(audit, 'extract_pdf_pages', return_value=pages):
+                result = audit.run_audit(pdf, raw, None, merged, root)
+            self.assertEqual(result['status'], 'review_required')
+            self.assertNotEqual(result['completeness'], 'complete')
+
+    def test_repeated_sentence_with_both_occurrences_is_complete(self):
+        repeated = 'These assumptions determine household savings every period.'
+        first = 'The opening section introduces aggregate production capital accumulation and firms. ' + repeated
+        second = repeated + ' The following section investigates monetary policy shocks under sticky prices.'
+        report = comp.reconcile([page(first, 1), page(second, 2)], first + '\n\n2\n\n' + second)
+        self.assertEqual(report['status'], 'complete')
+
+    def test_appended_caption_is_complete_through_real_merger(self):
+        from extract_pdf_to_md import merge_outputs_with_report
+        left = 'These households consume goods and supply productive labour every period.'
+        caption = 'Productivity changes household consumption through a persistent income channel.'
+        right = 'The government collects taxes and issues bonds under a separate budget constraint.'
+        source = left + '\n' + caption + '\n' + right
+        final, merge = merge_outputs_with_report(left + '\n\n' + right,
+            f'![{caption}](figures/figure-001.png)', 'appended', False)
+        self.assertEqual(merge['figures']['placed'], 1)
+        report = comp.reconcile([page(source)], final)
+        self.assertEqual(report['status'], 'complete')
+        self.assertEqual(report['pages'][0]['matched_text_fraction'], 1.0)
+        self.assertEqual(report['pages'][0]['fidelity_coverage'], 'full')
+
+    def test_relocated_footnote_is_complete(self):
+        left = 'These households consume goods and supply productive labour every period.'
+        note = 'Alternative estimates use an independently measured household consumption series.'
+        right = 'The government collects taxes and issues bonds under a separate budget constraint.'
+        source = left + '\n' + note + '\n' + right
+        final = left + '\n\n' + right + '\n\n[^1]: ' + note
+        self.assertEqual(comp.reconcile([page(source)], final)['status'], 'complete')
+
+    def test_competing_relocated_blocks_do_not_share_an_occurrence(self):
+        note = 'Alternative estimates use an independently measured household consumption series.'
+        one = 'The opening section introduces aggregate production capital accumulation and firms.'
+        two = 'The following section investigates monetary policy shocks under sticky prices.'
+        pages = [page(one + ' ' + note, 1), page(two + ' ' + note, 2)]
+        final = one + '\n\n2\n\n' + two + '\n\n[^1]: ' + note
+        self.assertNotEqual(comp.reconcile(pages, final)['status'], 'complete')
+
+    def test_ambiguous_relocation_does_not_claim_omission(self):
+        left = 'These households consume goods and supply productive labour every period.'
+        note = 'Alternative estimates use an independently measured household consumption series.'
+        right = 'The government collects taxes and issues bonds under a separate budget constraint.'
+        final = left + '\n\n' + right + '\n\n' + note + '\n\n' + note
+        result = comp.reconcile([page(left + ' ' + note + ' ' + right)], final)
+        self.assertEqual(result['status'], 'unknown')
+
     def ledger(self, text):
         old = '[MISSING_PAGE_EMPTY:2]'
         start = text.index(old)

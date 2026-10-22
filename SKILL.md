@@ -160,7 +160,9 @@ Optional LaTeX output is created with --to-latex when Pandoc is installed.
   markers mean incomplete conversion, even with `--skip-ocr-audit`.
 - The page map reconciles every readable PDF page against the **final merged
   Markdown**. `complete` means all normalized source text tokens were matched;
-  it does not verify images, layout, or mathematics absent from the PDF text
+  each source occurrence needs its own final occurrence, including relocated
+  captions/footnotes. Ambiguous ownership remains unknown. This does not verify
+  images, layout, or mathematics absent from the PDF text
   layer. Blank/scanned pages and ambiguous mappings remain `unknown`.
 - Use `--require-complete` in automated consumers: exit 2 means incomplete or
   unknown content, with output and reports retained. Default runs retain their
